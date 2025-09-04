@@ -1,11 +1,9 @@
 # app.py
 from __future__ import annotations
-
+from pathlib import Path
 import io
 import re
-import unicodedata
-from pathlib import Path
-
+import os
 import pandas as pd
 import streamlit as st
 
@@ -20,19 +18,11 @@ st.set_page_config(
 BASE = Path(__file__).parent.resolve()
 KERDESBANK_DIR = BASE / "KERDESBANKOK"
 
-# -------------------- Segédfüggvények --------------------
-def _ascii_fold(s: str) -> str:
-    """Ékezetek eltávolítása biztonságosan (NFD + combining mark szűrés)."""
-    if not isinstance(s, str):
-        s = str(s)
-    return "".join(
-        ch for ch in unicodedata.normalize("NFD", s)
-        if unicodedata.category(ch) != "Mn"
-    )
-
 def _norm_txt(s: str) -> str:
-    """Kisbetűsítés + ékezetmentesítés + nem-alfanumerikus -> szóköz."""
-    s = _ascii_fold(str(s)).lower().strip()
+    """Ékezetlenített, kisbetűs, nem alfanumerikus jeleket szóközre cserélő normalizálás."""
+    s = str(s).strip().lower()
+    table = str.maketrans("áéíóöőúüű", "aeioooouuu")
+    s = s.translate(table)
     s = re.sub(r"[^0-9a-z]+", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
     return s
@@ -41,7 +31,6 @@ def _tokens(s: str) -> set[str]:
     return set(_norm_txt(s).split())
 
 def _list_xlsx() -> list[Path]:
-    """Összegyűjti a .xlsx fájlokat a projekt gyökérből és a KERDESBANKOK mappából."""
     cand_dirs = [BASE, KERDESBANK_DIR]
     files: list[Path] = []
     for d in cand_dirs:
@@ -49,7 +38,7 @@ def _list_xlsx() -> list[Path]:
             files.extend(sorted(d.glob("*.xlsx")))
     return files
 
-# DEBUG – mit látunk?
+# DEBUG: mit látunk?
 st.write("DEBUG – BASE tartalma:", [p.name for p in BASE.iterdir() if p.exists()])
 st.write("DEBUG – KERDESBANKOK létezik?:", KERDESBANK_DIR.exists())
 st.write("DEBUG – Elérhető .xlsx fájlok:", [p.name for p in _list_xlsx()])
@@ -63,53 +52,51 @@ BANK_CIMEK = [
 ]
 
 def _bank_cim_to_required_tokens(bank_cim: str) -> set[str]:
-    """A kiválasztott bank címkéjéből tokeneket képezünk,
+    """A kiválasztott bank címkéjéből olyan tokeneket képezünk,
     amiknek a fájlnévben is szerepelniük kell (normalizált formában)."""
     t = _tokens(bank_cim)
     req = set()
+    # szemelyes/tarsas/kompetenciak
     if "szemelyes" in t:
         req.add("szemelyes")
     if "tarsas" in t:
         req.add("tarsas")
-    # a fájlnevekben jellemzően 'kompetenciak' szerepel
-    req.add("kompetenciak")
+    req.add("kompetenciak")  # a fájlokban többnyire ez szerepel
+    # évfolyamok
     if "5" in t and "6" in t:
         req.update({"5", "6"})
     if "7" in t and "8" in t:
         req.update({"7", "8"})
     # oszt / osztaly – bármelyik jó
-    req.add("oszt")
+    req.add("oszt")  # a legtöbb fájlnévben röviden jelenik meg
     return req
 
 def resolve_excel_for_bank(bank_cim: str) -> Path | None:
-    """Megpróbálja megtalálni a .xlsx fájlt lazán illesztve (ékezet/kötőjel/szóköz/underscore mindegy)."""
+    """Megpróbáljuk megtalálni a hozzá tartozó .xlsx fájlt lazán illesztve."""
     req = _bank_cim_to_required_tokens(bank_cim)
     candidates = _list_xlsx()
     best: tuple[int, Path] | None = None
-
     for p in candidates:
-        toks = _tokens(p.stem)
-        if not req.issubset(toks):
+        toks = _tokens(p.stem)  # kiterjesztés nélkül
+        # elfogadjuk, ha az összes kötelező token benne van
+        ok = req.issubset(toks)
+        if not ok:
             continue
-        score = len(toks)  # kevesebb zaj → kisebb score
+        score = len(toks)  # primitív pontozás: kevesebb zaj jobb
         if best is None or score < best[0]:
             best = (score, p)
+    # ha nem találtunk teljes fedést, próbáljuk „osztaly”/„oszt” cserével is
+    if best is None:
+        alt_req = set(req)
+        alt_req.discard("oszt")
+        alt_req.add("osztaly")
+        for p in candidates:
+            toks = _tokens(p.stem)
+            if alt_req.issubset(toks):
+                return p
+    return best[1] if best else None
 
-    if best:
-        return best[1]
-
-    # második kör: 'oszt' helyett 'osztaly'
-    alt_req = set(req)
-    alt_req.discard("oszt")
-    alt_req.add("osztaly")
-    for p in candidates:
-        toks = _tokens(p.stem)
-        if alt_req.issubset(toks):
-            return p
-
-    return None
-
-# Kategória címkék (opcionális – ha illeszthetőek)
+# Kategória-kód → felirat (A–H). Csak az előfordulókat mutatjuk.
 KATEGORIA_LABEL = {
     "A": "Önismeret, önértékelés, önbizalom",
     "B": "Motiváció, optimizmus, teljesítményvágy",
@@ -136,9 +123,10 @@ def betolt_xlsx(path: Path) -> pd.DataFrame:
 
     # Normalizált oszlopnevek (ékezet és whitespace kezelése)
     def norm(s: str) -> str:
-        s2 = _ascii_fold(str(s)).lower().strip()
+        s2 = s.strip().lower()
         s2 = re.sub(r"\s+", "_", s2)
-        return s2
+        table = str.maketrans("áéíóöőúüű", "aeioooouuu")
+        return s2.translate(table)
 
     dfn = df.rename(columns={c: norm(c) for c in df.columns})
 
@@ -299,16 +287,16 @@ valaszok_long.rename(columns={
     "score": "Pont (inverz után)",
 }, inplace=True)
 
-# Egysoros "wide" táblázat: kategóriaátlagok
-wide = bank_df.groupby("kategoria")["score"].mean().to_frame().T
+wide = (
+    bank_df.assign(kat=bank_df["kategoria"])
+    .pivot_table(index=None, values="score", columns="kat", aggfunc="mean")
+)
 wide.index = [0]
 
 buf = io.BytesIO()
 with pd.ExcelWriter(buf, engine="xlsxwriter") as wr:
     valaszok_long.to_excel(wr, sheet_name="valaszok", index=False)
-    bank_df[["kategoria", "kerdes", "inverse", "raw", "score"]].to_excel(
-        wr, sheet_name="atalakitott", index=False
-    )
+    bank_df[["kategoria", "kerdes", "inverse", "raw", "score"]].to_excel(wr, sheet_name="atalakitott", index=False)
     kat_agg.to_excel(wr, sheet_name="kategoriak", index=False)
     wide.to_excel(wr, sheet_name="kategoriak_wide", index=False)
 
@@ -320,8 +308,4 @@ st.download_button(
     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
 )
 
-st.caption(
-    f"Név: **{st.session_state.get('nev','')}**, "
-    f"Osztály: **{st.session_state.get('osztaly','')}**, "
-    f"Bank: **{bank_cim}**"
-)
+st.caption(f"Név: **{st.session_state.get('nev','')}**, Osztály: **{st.session_state.get('osztaly','')}**, Bank: **{bank_cim}**")
