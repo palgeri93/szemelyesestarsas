@@ -213,4 +213,99 @@ except Exception as e:
 # -------------------- Kitöltő felület --------------------
 st.markdown(f"### {bank_cim}")
 if not st.session_state.get("nev") or not st.session_state.get("osztaly"):
-    st.warning("A folytatáshoz add meg a **Név** és **Osztály** mezőket a felső
+    st.warning("A folytatáshoz add meg a **Név** és **Osztály** mezőket a felső űrlapon.")
+    st.stop()
+
+if "valaszok" not in st.session_state:
+    st.session_state["valaszok"] = {}
+valaszok: dict[int, int] = st.session_state["valaszok"]
+
+st.divider()
+st.write("Jelöld meg, mennyire jellemzőek rád az alábbi állítások (1–5).")
+
+for i, sor in bank_df.iterrows():
+    kerdes = sor["kerdes"]
+    key = f"q_{i}"
+    default_idx = valaszok.get(i, None)
+    idx = st.radio(
+        f"{i+1}. {kerdes}",
+        options=list(range(len(LIKERT_OPCIOK))),
+        format_func=lambda k: LIKERT_OPCIOK[k],
+        index=default_idx if default_idx is not None else None,
+        horizontal=True,
+        key=key,
+    )
+    if idx is not None:
+        valaszok[i] = idx
+
+osszes_kerdes = len(bank_df)
+megvalaszolt = len(valaszok)
+if megvalaszolt < osszes_kerdes:
+    st.warning(f"Még **{osszes_kerdes - megvalaszolt}** kérdésre nem válaszoltál.")
+    st.stop()
+
+# -------------------- Pontszámítás (inverz is) --------------------
+bank_df["raw"] = [valaszok[i] + 1 for i in range(osszes_kerdes)]  # 1..5
+bank_df["score"] = bank_df.apply(lambda r: 6 - r["raw"] if r["inverse"] else r["raw"], axis=1)
+
+# -------------------- Kategória-összesítés --------------------
+kat_agg = (
+    bank_df.groupby("kategoria")["score"]
+    .agg(["count", "sum", "mean"])
+    .reset_index()
+    .sort_values("kategoria")
+    .rename(columns={"count": "tételszám", "sum": "összpont", "mean": "átlag"})
+)
+
+def kat_cim(k: str) -> str:
+    k2 = str(k).strip()
+    return f"{k2} – {KATEGORIA_LABEL[k2]}" if k2 in KATEGORIA_LABEL else k2
+
+kat_agg["kategória"] = kat_agg["kategoria"].map(kat_cim)
+kat_agg = kat_agg[["kategória", "tételszám", "összpont", "átlag"]]
+
+st.divider()
+st.markdown("### Eredmények")
+
+col_a, col_b = st.columns([2, 1])
+with col_a:
+    st.subheader("Kategória-összesítés")
+    st.dataframe(kat_agg, hide_index=True, use_container_width=True)
+with col_b:
+    st.metric("Összpont (összes kérdés)", int(bank_df["score"].sum()))
+
+# -------------------- Letöltés XLSX --------------------
+st.divider()
+st.subheader("Riport letöltése")
+
+valaszok_long = bank_df[["kategoria", "kerdes", "inverse", "raw", "score"]].copy()
+valaszok_long.rename(columns={
+    "kategoria": "Kategória",
+    "kerdes": "Kérdés",
+    "inverse": "Inverz kérdés?",
+    "raw": "Jelölt érték (1..5)",
+    "score": "Pont (inverz után)",
+}, inplace=True)
+
+wide = (
+    bank_df.assign(kat=bank_df["kategoria"])
+    .pivot_table(index=None, values="score", columns="kat", aggfunc="mean")
+)
+wide.index = [0]
+
+buf = io.BytesIO()
+with pd.ExcelWriter(buf, engine="xlsxwriter") as wr:
+    valaszok_long.to_excel(wr, sheet_name="valaszok", index=False)
+    bank_df[["kategoria", "kerdes", "inverse", "raw", "score"]].to_excel(wr, sheet_name="atalakitott", index=False)
+    kat_agg.to_excel(wr, sheet_name="kategoriak", index=False)
+    wide.to_excel(wr, sheet_name="kategoriak_wide", index=False)
+
+fnev = f"kompetencia_eredmeny_{(st.session_state.get('nev') or 'tanulo').replace(' ', '_')}.xlsx"
+st.download_button(
+    "Eredmény letöltése (XLSX)",
+    data=buf.getvalue(),
+    file_name=fnev,
+    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+)
+
+st.caption(f"Név: **{st.session_state.get('nev','')}**, Osztály: **{st.session_state.get('osztaly','')}**, Bank: **{bank_cim}**")
